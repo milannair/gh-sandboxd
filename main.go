@@ -173,51 +173,49 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("run: %q", req.Cmd)
 
-	if len(req.Files) > 0 {
-		mountDir, err := os.MkdirTemp("", "rootfs-mount-")
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		defer os.RemoveAll(mountDir)
+	mountDir, err := os.MkdirTemp("", "rootfs-mount-")
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer os.RemoveAll(mountDir)
 
-		mountCmd := exec.Command("mount", "-o", "loop", rootfsPath, mountDir)
-		if err := mountCmd.Run(); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
+	mountCmd := exec.Command("mount", "-o", "loop", rootfsPath, mountDir)
+	if err := mountCmd.Run(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 
-		unmountErr := func() error {
-			return exec.Command("umount", mountDir).Run()
-		}
+	unmountErr := func() error {
+		return exec.Command("umount", mountDir).Run()
+	}
 
-		workDir := mountDir + "/work"
-		if err := os.MkdirAll(workDir, 0o755); err != nil {
+	workDir := mountDir + "/work"
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		_ = unmountErr()
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	for name, content := range req.Files {
+		targetPath := workDir + "/" + name
+		if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
 			_ = unmountErr()
 			http.Error(w, err.Error(), 500)
 			return
 		}
-
-		for name, content := range req.Files {
-			targetPath := workDir + "/" + name
-			if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
+		if strings.HasPrefix(content, "#!") {
+			if err := os.Chmod(targetPath, 0o755); err != nil {
 				_ = unmountErr()
 				http.Error(w, err.Error(), 500)
 				return
 			}
-			if strings.HasPrefix(content, "#!") {
-				if err := os.Chmod(targetPath, 0o755); err != nil {
-					_ = unmountErr()
-					http.Error(w, err.Error(), 500)
-					return
-				}
-			}
 		}
+	}
 
-		if err := unmountErr(); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
+	if err := unmountErr(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
 
 	fc, consoleFile, err := startFirecracker()
