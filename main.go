@@ -17,7 +17,9 @@ import (
 )
 
 type RunRequest struct {
-	Cmd string `json:"cmd"`
+	Cmd       string            `json:"cmd"`
+	Files     map[string]string `json:"files"`
+	TimeoutMs int               `json:"timeout_ms"`
 }
 
 type RunResponse struct {
@@ -230,21 +232,62 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stdout, exitCode, waitErr := waitForGuestCompletion(8 * time.Second)
-
-	stderr := ""
-	if waitErr != nil {
-		stderr = waitErr.Error()
+	timeoutMs := req.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
 	}
 
-	resp := RunResponse{
-		Stdout:   stdout,
-		Stderr:   stderr,
-		ExitCode: exitCode,
-	}
+	done := make(chan struct{})
+	var (
+		stdout   string
+		exitCode int
+		waitErr  error
+	)
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	go func() {
+		stdout, exitCode, waitErr = waitForGuestCompletion(
+			time.Duration(timeoutMs) * time.Millisecond,
+		)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if fc.Process != nil {
+			_ = fc.Process.Kill()
+		}
+		_ = fc.Wait()
+
+		stderr := ""
+		if waitErr != nil {
+			stderr = waitErr.Error()
+		}
+
+		resp := RunResponse{
+			Stdout:   stdout,
+			Stderr:   stderr,
+			ExitCode: exitCode,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
+		if fc.Process != nil {
+			_ = fc.Process.Kill()
+		}
+		_ = fc.Wait()
+
+		resp := RunResponse{
+			Stdout:   "",
+			Stderr:   "execution timed out",
+			ExitCode: 124,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
 }
 
 /* ---------------- main ---------------- */
