@@ -111,7 +111,29 @@ func fcPut(path string, body any) error {
 	return nil
 }
 
-/* ---------------- Guest completion detection ---------------- */
+/* ---------------- Guest console parsing ---------------- */
+
+// Wait until the guest init actually starts (so we don't count boot time against timeout_ms).
+func waitForGuestInitStarted(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(fcConsole)
+		if err == nil {
+			text := strings.ReplaceAll(string(b), "\r\n", "\n")
+			if strings.Contains(text, "[guest] init started") {
+				return nil
+			}
+			// If the guest already halted/panicked, don't wait forever.
+			if strings.Contains(text, "Kernel panic") || strings.Contains(text, "reboot: System halted") {
+				return fmt.Errorf("guest did not reach init started (halt/panic)")
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return fmt.Errorf("timeout waiting for guest init started")
+}
 
 func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int, err error) {
 	deadline := time.Now().Add(timeout)
@@ -121,16 +143,14 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 		if readErr == nil {
 			text := strings.ReplaceAll(string(b), "\r\n", "\n")
 
-			// Extract guest stdout only
 			lines := []string{}
 			for _, line := range strings.Split(text, "\n") {
-				if strings.HasPrefix(line, "[guest]") ||
-					strings.Contains(line, "hello from microvm") {
+				// Keep only guest lines (don't filter on "hello from microvm" anymore)
+				if strings.HasPrefix(line, "[guest]") {
 					lines = append(lines, line)
 				}
 			}
 
-			// Parse exit code
 			for _, line := range lines {
 				if strings.HasPrefix(line, "[guest] exit code:") {
 					parts := strings.Split(line, ":")
@@ -141,8 +161,8 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 				}
 			}
 
-			// Fallback completion signal
 			if strings.Contains(text, "reboot: System halted") {
+				// If we halted but didn't print exit code, treat as success-ish.
 				return strings.Join(lines, "\n") + "\n", 0, nil
 			}
 		}
@@ -232,11 +252,26 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ---- Timeout semantics fix ----
 	timeoutMs := req.TimeoutMs
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
 	}
 
+	// Boot grace: wait for init-start marker (does not consume timeout_ms).
+	// If boot is slow, fail with a clear error.
+	if err := waitForGuestInitStarted(5 * time.Second); err != nil {
+		resp := RunResponse{
+			Stdout:   "",
+			Stderr:   "boot timeout: " + err.Error(),
+			ExitCode: 124,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Now start the real execution timeout.
 	done := make(chan struct{})
 	var (
 		stdout   string
@@ -245,9 +280,7 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 	)
 
 	go func() {
-		stdout, exitCode, waitErr = waitForGuestCompletion(
-			time.Duration(timeoutMs) * time.Millisecond,
-		)
+		stdout, exitCode, waitErr = waitForGuestCompletion(time.Duration(timeoutMs) * time.Millisecond)
 		close(done)
 	}()
 
@@ -272,6 +305,7 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
+
 	case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
 		if fc.Process != nil {
 			_ = fc.Process.Kill()
@@ -294,6 +328,6 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	http.HandleFunc("/run", runHandler)
-	log.Println("sandboxd v0 listening on :7777")
+	log.Println("sandboxd listening on :7777")
 	log.Fatal(http.ListenAndServe(":7777", nil))
 }
