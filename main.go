@@ -299,7 +299,7 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		cmdForGuest = fmt.Sprintf("cd /work && %s", req.Cmd)
 	}
 	bootArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init CMD=\"%s\"",
+		"console=ttyS0 quiet loglevel=0 reboot=k panic=1 pci=off init=/sbin/init CMD=\"%s\"",
 		cmdForGuest,
 	)
 
