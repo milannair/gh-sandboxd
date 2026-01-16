@@ -333,8 +333,12 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		close(done)
 	}()
 
+	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+	defer timer.Stop()
+
 	select {
 	case <-done:
+		timer.Stop()
 		if fc.Process != nil {
 			_ = fc.Process.Kill()
 		}
@@ -355,7 +359,7 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(resp)
 		return
 
-	case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
+	case <-timer.C:
 		if fc.Process != nil {
 			_ = fc.Process.Kill()
 		}
