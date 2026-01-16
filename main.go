@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -174,6 +175,25 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 	return string(b), 124, fmt.Errorf("timeout waiting for guest completion")
 }
 
+func resolveWorkPath(workDir, name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("file name is empty")
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+	clean := filepath.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path traversal is not allowed")
+	}
+	targetPath := filepath.Join(workDir, clean)
+	rel, err := filepath.Rel(workDir, targetPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes work dir")
+	}
+	return targetPath, nil
+}
+
 /* ---------------- HTTP handler ---------------- */
 
 func runHandler(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +239,12 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for name, content := range req.Files {
-		targetPath := workDir + "/" + name
+		targetPath, err := resolveWorkPath(workDir, name)
+		if err != nil {
+			_ = unmountErr()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
 			_ = unmountErr()
 			http.Error(w, err.Error(), 500)
