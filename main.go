@@ -47,6 +47,11 @@ func startFirecracker() (*exec.Cmd, *os.File, error) {
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, nil, err
 	}
+	logFile, err := os.Create(fcLog)
+	if err != nil {
+		return nil, nil, err
+	}
+	_ = logFile.Close()
 
 	consoleFile, err := os.Create(fcConsole)
 	if err != nil {
@@ -278,6 +283,23 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if err := waitForSocket(fcSocket, 10*time.Second); err != nil {
+		logText, readErr := os.ReadFile(fcLog)
+		if readErr == nil {
+			text := strings.ReplaceAll(string(logText), "\r\n", "\n")
+			text = strings.TrimRight(text, "\n")
+			lines := []string{}
+			if text != "" {
+				lines = strings.Split(text, "\n")
+				if len(lines) > 50 {
+					lines = lines[len(lines)-50:]
+				}
+			}
+			snippet := strings.Join(lines, "\n")
+			if snippet != "" {
+				http.Error(w, fmt.Sprintf("%s\nfirecracker log:\n%s", err.Error(), snippet), 500)
+				return
+			}
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
