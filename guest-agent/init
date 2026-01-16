@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+# Mount the agent drive at /run/agent
+mkdir -p /run/agent
+mount /dev/vdb /run/agent
+
+# Run the command and capture output
+sh -c "$CMD" > /tmp/stdout 2> /tmp/stderr
+echo $? > /tmp/exitcode
+
+# Send results via guest-agent
+/usr/bin/guest-agent
+
+# Cleanup and shutdown
+poweroff -f

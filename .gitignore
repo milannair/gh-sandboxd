@@ -1,0 +1,13 @@
+# Built binaries
+sandboxd
+guest-agent/guest-agent
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
