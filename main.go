@@ -32,19 +32,27 @@ type RunResponse struct {
 const (
 	fcSocket   = "/tmp/fc.sock"
 	fcConsole  = "/tmp/fc-console.log"
+	fcLog      = "/tmp/firecracker.log"
 	kernelPath = "/home/milan/fc/hello-vmlinux.bin"
 	rootfsPath = "/home/milan/fc/rootfs.ext4"
 )
 
 /* ---------------- Firecracker helpers ---------------- */
 
-func startFirecracker() (*exec.Cmd, *os.File, error) {
+func startFirecracker() (*exec.Cmd, *os.File, *os.File, error) {
 	_ = os.Remove(fcSocket)
 	_ = os.Remove(fcConsole)
+	_ = os.Remove(fcLog)
 
 	consoleFile, err := os.Create(fcConsole)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	logFile, err := os.Create(fcLog)
+	if err != nil {
+		_ = consoleFile.Close()
+		return nil, nil, nil, err
 	}
 
 	cmd := exec.Command(
@@ -54,14 +62,15 @@ func startFirecracker() (*exec.Cmd, *os.File, error) {
 	)
 
 	cmd.Stdout = consoleFile
-	cmd.Stderr = consoleFile
+	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
 		_ = consoleFile.Close()
-		return nil, nil, err
+		_ = logFile.Close()
+		return nil, nil, nil, err
 	}
 
-	return cmd, consoleFile, nil
+	return cmd, consoleFile, logFile, nil
 }
 
 func waitForSocket(path string, timeout time.Duration) error {
@@ -144,27 +153,18 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 		if readErr == nil {
 			text := strings.ReplaceAll(string(b), "\r\n", "\n")
 
-			lines := []string{}
 			for _, line := range strings.Split(text, "\n") {
-				// Keep only guest lines (don't filter on "hello from microvm" anymore)
-				if strings.HasPrefix(line, "[guest]") {
-					lines = append(lines, line)
-				}
-			}
-
-			for _, line := range lines {
 				if strings.HasPrefix(line, "[guest] exit code:") {
 					parts := strings.Split(line, ":")
 					if len(parts) == 2 {
 						code, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
-						return strings.Join(lines, "\n") + "\n", code, nil
+						return text, code, nil
 					}
 				}
 			}
 
 			if strings.Contains(text, "reboot: System halted") {
-				// If we halted but didn't print exit code, treat as success-ish.
-				return strings.Join(lines, "\n") + "\n", 0, nil
+				return text, 0, nil
 			}
 		}
 
@@ -172,7 +172,8 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 	}
 
 	b, _ := os.ReadFile(fcConsole)
-	return string(b), 124, fmt.Errorf("timeout waiting for guest completion")
+	text := strings.ReplaceAll(string(b), "\r\n", "\n")
+	return text, 124, fmt.Errorf("timeout waiting for guest completion")
 }
 
 func resolveWorkPath(workDir, name string) (string, error) {
@@ -264,12 +265,13 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fc, consoleFile, err := startFirecracker()
+	fc, consoleFile, logFile, err := startFirecracker()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	defer consoleFile.Close()
+	defer logFile.Close()
 
 	defer func() {
 		if fc.Process != nil {
