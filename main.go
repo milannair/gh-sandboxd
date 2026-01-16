@@ -11,14 +11,16 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type RunRequest struct {
-	Cmd   string            `json:"cmd"`
-	Files map[string]string `json:"files"`
+	Cmd       string            `json:"cmd"`
+	Files     map[string]string `json:"files"`
+	TimeoutMs int               `json:"timeout_ms"`
 }
 
 type RunResponse struct {
@@ -110,7 +112,29 @@ func fcPut(path string, body any) error {
 	return nil
 }
 
-/* ---------------- Guest completion detection ---------------- */
+/* ---------------- Guest console parsing ---------------- */
+
+// Wait until the guest init actually starts (so we don't count boot time against timeout_ms).
+func waitForGuestInitStarted(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(fcConsole)
+		if err == nil {
+			text := strings.ReplaceAll(string(b), "\r\n", "\n")
+			if strings.Contains(text, "[guest] init started") {
+				return nil
+			}
+			// If the guest already halted/panicked, don't wait forever.
+			if strings.Contains(text, "Kernel panic") || strings.Contains(text, "reboot: System halted") {
+				return fmt.Errorf("guest did not reach init started (halt/panic)")
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return fmt.Errorf("timeout waiting for guest init started")
+}
 
 func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int, err error) {
 	deadline := time.Now().Add(timeout)
@@ -120,16 +144,14 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 		if readErr == nil {
 			text := strings.ReplaceAll(string(b), "\r\n", "\n")
 
-			// Extract guest stdout only
 			lines := []string{}
 			for _, line := range strings.Split(text, "\n") {
-				if strings.HasPrefix(line, "[guest]") ||
-					strings.Contains(line, "hello from microvm") {
+				// Keep only guest lines (don't filter on "hello from microvm" anymore)
+				if strings.HasPrefix(line, "[guest]") {
 					lines = append(lines, line)
 				}
 			}
 
-			// Parse exit code
 			for _, line := range lines {
 				if strings.HasPrefix(line, "[guest] exit code:") {
 					parts := strings.Split(line, ":")
@@ -140,8 +162,8 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 				}
 			}
 
-			// Fallback completion signal
 			if strings.Contains(text, "reboot: System halted") {
+				// If we halted but didn't print exit code, treat as success-ish.
 				return strings.Join(lines, "\n") + "\n", 0, nil
 			}
 		}
@@ -151,6 +173,25 @@ func waitForGuestCompletion(timeout time.Duration) (stdout string, exitCode int,
 
 	b, _ := os.ReadFile(fcConsole)
 	return string(b), 124, fmt.Errorf("timeout waiting for guest completion")
+}
+
+func resolveWorkPath(workDir, name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("file name is empty")
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+	clean := filepath.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path traversal is not allowed")
+	}
+	targetPath := filepath.Join(workDir, clean)
+	rel, err := filepath.Rel(workDir, targetPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes work dir")
+	}
+	return targetPath, nil
 }
 
 /* ---------------- HTTP handler ---------------- */
@@ -198,7 +239,12 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for name, content := range req.Files {
-		targetPath := workDir + "/" + name
+		targetPath, err := resolveWorkPath(workDir, name)
+		if err != nil {
+			_ = unmountErr()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
 			_ = unmountErr()
 			http.Error(w, err.Error(), 500)
@@ -280,27 +326,86 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stdout, exitCode, waitErr := waitForGuestCompletion(8 * time.Second)
-
-	stderr := ""
-	if waitErr != nil {
-		stderr = waitErr.Error()
+	// ---- Timeout semantics fix ----
+	timeoutMs := req.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
 	}
 
-	resp := RunResponse{
-		Stdout:   stdout,
-		Stderr:   stderr,
-		ExitCode: exitCode,
+	// Boot grace: wait for init-start marker (does not consume timeout_ms).
+	// If boot is slow, fail with a clear error.
+	if err := waitForGuestInitStarted(5 * time.Second); err != nil {
+		resp := RunResponse{
+			Stdout:   "",
+			Stderr:   "boot timeout: " + err.Error(),
+			ExitCode: 124,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	// Now start the real execution timeout.
+	done := make(chan struct{})
+	var (
+		stdout   string
+		exitCode int
+		waitErr  error
+	)
+
+	go func() {
+		stdout, exitCode, waitErr = waitForGuestCompletion(time.Duration(timeoutMs) * time.Millisecond)
+		close(done)
+	}()
+
+	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		timer.Stop()
+		if fc.Process != nil {
+			_ = fc.Process.Kill()
+		}
+		_ = fc.Wait()
+
+		stderr := ""
+		if waitErr != nil {
+			stderr = waitErr.Error()
+		}
+
+		resp := RunResponse{
+			Stdout:   stdout,
+			Stderr:   stderr,
+			ExitCode: exitCode,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+
+	case <-timer.C:
+		if fc.Process != nil {
+			_ = fc.Process.Kill()
+		}
+		_ = fc.Wait()
+
+		resp := RunResponse{
+			Stdout:   "",
+			Stderr:   "execution timed out",
+			ExitCode: 124,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
 }
 
 /* ---------------- main ---------------- */
 
 func main() {
 	http.HandleFunc("/run", runHandler)
-	log.Println("sandboxd v0 listening on :7777")
+	log.Println("sandboxd listening on :7777")
 	log.Fatal(http.ListenAndServe(":7777", nil))
 }
