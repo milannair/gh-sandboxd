@@ -32,45 +32,43 @@ type RunResponse struct {
 const (
 	fcSocket   = "/tmp/fc.sock"
 	fcConsole  = "/tmp/guest-console.log"
-	fcLog      = "/tmp/firecracker.log"
+	fcLog      = "/tmp/firecracker/firecracker.log"
 	kernelPath = "/home/milan/fc/hello-vmlinux.bin"
 	rootfsPath = "/home/milan/fc/rootfs.ext4"
 )
 
 /* ---------------- Firecracker helpers ---------------- */
 
-func startFirecracker() (*exec.Cmd, *os.File, *os.File, error) {
+func startFirecracker() (*exec.Cmd, *os.File, error) {
 	_ = os.Remove(fcSocket)
 	_ = os.Remove(fcConsole)
-	_ = os.Remove(fcLog)
+
+	logDir := filepath.Dir(fcLog)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, nil, err
+	}
 
 	consoleFile, err := os.Create(fcConsole)
 	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	logFile, err := os.Create(fcLog)
-	if err != nil {
-		_ = consoleFile.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	cmd := exec.Command(
 		"firecracker",
 		"--api-sock", fcSocket,
-		"--level", "Info",
+		"--log-path", fcLog,
+		"--level", "Error",
 	)
 
 	cmd.Stdout = consoleFile
-	cmd.Stderr = logFile
+	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
 		_ = consoleFile.Close()
-		_ = logFile.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	return cmd, consoleFile, logFile, nil
+	return cmd, consoleFile, nil
 }
 
 func waitForSocket(path string, timeout time.Duration) error {
@@ -265,13 +263,12 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fc, consoleFile, logFile, err := startFirecracker()
+	fc, consoleFile, err := startFirecracker()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	defer consoleFile.Close()
-	defer logFile.Close()
 
 	defer func() {
 		if fc.Process != nil {
