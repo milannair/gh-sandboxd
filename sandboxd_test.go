@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,6 +37,31 @@ func runRequest(t *testing.T, payload any) RunResponse {
 	return resp
 }
 
+func assertStdoutClean(t *testing.T, stdout string) {
+	t.Helper()
+
+	data, err := os.ReadFile(fcLog)
+	if err != nil {
+		t.Fatalf("read firecracker log: %v", err)
+	}
+
+	logText := strings.ReplaceAll(string(data), "\r\n", "\n")
+	logText = strings.TrimSpace(logText)
+	if logText == "" {
+		t.Skip("firecracker log empty; cannot assert separation")
+	}
+
+	for _, line := range strings.Split(logText, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(stdout, line) {
+			t.Fatalf("stdout contains firecracker log line: %q", line)
+		}
+	}
+}
+
 func TestSimpleEcho(t *testing.T) {
 	resp := runRequest(t, map[string]any{
 		"cmd":        "echo hi",
@@ -44,9 +71,13 @@ func TestSimpleEcho(t *testing.T) {
 	if resp.ExitCode != 0 {
 		t.Fatalf("expected exit_code 0, got %d", resp.ExitCode)
 	}
-	if resp.Stdout == "" {
-		t.Fatalf("expected stdout, got empty")
+	if resp.Stderr != "" {
+		t.Fatalf("expected empty stderr, got %q", resp.Stderr)
 	}
+	if !strings.Contains(resp.Stdout, "hi") {
+		t.Fatalf("expected stdout to contain %q, got %q", "hi", resp.Stdout)
+	}
+	assertStdoutClean(t, resp.Stdout)
 }
 
 func TestBoundaryTimeout(t *testing.T) {
@@ -57,6 +88,9 @@ func TestBoundaryTimeout(t *testing.T) {
 
 	if resp.ExitCode != 0 {
 		t.Fatalf("expected exit_code 0, got %d", resp.ExitCode)
+	}
+	if resp.Stderr != "" {
+		t.Fatalf("expected empty stderr, got %q", resp.Stderr)
 	}
 }
 
@@ -70,6 +104,9 @@ func TestHardTimeout(t *testing.T) {
 
 	if resp.ExitCode != 124 {
 		t.Fatalf("expected exit_code 124, got %d", resp.ExitCode)
+	}
+	if resp.Stderr != "execution timed out" {
+		t.Fatalf("expected timeout stderr, got %q", resp.Stderr)
 	}
 
 	if time.Since(start) > 3*time.Second {
@@ -89,8 +126,11 @@ func TestFileInjection(t *testing.T) {
 	if resp.ExitCode != 0 {
 		t.Fatalf("expected exit_code 0, got %d", resp.ExitCode)
 	}
-	if resp.Stdout == "" {
-		t.Fatalf("expected stdout, got empty")
+	if resp.Stderr != "" {
+		t.Fatalf("expected empty stderr, got %q", resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "file ok") {
+		t.Fatalf("expected stdout to contain %q, got %q", "file ok", resp.Stdout)
 	}
 }
 
@@ -105,5 +145,8 @@ func TestFileInjectionTimeout(t *testing.T) {
 
 	if resp.ExitCode != 124 {
 		t.Fatalf("expected exit_code 124, got %d", resp.ExitCode)
+	}
+	if resp.Stderr != "execution timed out" {
+		t.Fatalf("expected timeout stderr, got %q", resp.Stderr)
 	}
 }
