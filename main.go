@@ -31,7 +31,7 @@ type RunResponse struct {
 
 const (
 	fcSocket   = "/tmp/fc.sock"
-	fcConsole  = "/tmp/fc-console.log"
+	fcConsole  = "/tmp/guest-console.log"
 	fcLog      = "/tmp/firecracker.log"
 	kernelPath = "/home/milan/fc/hello-vmlinux.bin"
 	rootfsPath = "/home/milan/fc/rootfs.ext4"
